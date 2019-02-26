@@ -12,13 +12,13 @@ import (
 )
 
 var (
-	unknown    = "-1"
-	standalone = "0"
-	leader     = "1"
-	follower   = "2"
+	unknown    float64 = -1
+	standalone float64 = 0
+	leader     float64 = 1
+	follower   float64 = 2
 )
 
-func getState(value string) string {
+func getState(value string) float64 {
 	switch value {
 	case "standalone":
 		return standalone
@@ -32,12 +32,7 @@ func getState(value string) string {
 }
 
 // open tcp connections to zk nodes, send 'mntr' and return result as a map
-func getMetrics() (map[string]string, map[string]string) {
-	metrics := map[string]string{}
-	labels := map[string]string{}
-
-	metrics["zk_serving_requests"] = "0"
-
+func getRawMetrics() (list []string, err error) {
 	// open connection
 	timeout := time.Duration(*zkTimeout) * time.Second
 	dialer := net.Dialer{Timeout: timeout}
@@ -46,7 +41,6 @@ func getMetrics() (map[string]string, map[string]string) {
 
 	if err != nil {
 		log.Printf("warning: cannot connect to %s: %v", *zkAddress, err)
-		return metrics, labels
 	}
 
 	_, err = connection.Write([]byte("mntr"))
@@ -59,13 +53,23 @@ func getMetrics() (map[string]string, map[string]string) {
 	// get slice of strings from response, like 'zk_avg_latency 0'
 	lines := strings.Split(string(res), "\n")
 
+	return lines, nil
+}
+
+func parseMetrics(lines []string) (map[string]float64, map[string]string) {
+	metrics := map[string]float64{}
+	labels := map[string]string{}
+
+	metrics["zk_serving_requests"] = 0
+
 	// skip instance if it in a leader only state and doesnt serving client requets
 	if lines[0] == "This ZooKeeper instance is not currently serving requests" {
 		return metrics, labels
 	}
 
-	metrics["zk_serving_requests"] = "1"
+	metrics["zk_serving_requests"] = 1
 
+	rawMetrics := map[string]string{}
 	re := regexp.MustCompile(`(.+)\t(.+)`)
 	for _, line := range lines {
 		match := re.FindStringSubmatch(line)
@@ -75,16 +79,26 @@ func getMetrics() (map[string]string, map[string]string) {
 
 		key := match[1]
 		value := match[2]
-		metrics[key] = value
+		rawMetrics[key] = value
 	}
 
-	labels["zk_version"] = strings.Split(metrics["zk_version"], "-")[0]
+	labels["zk_version"] = strings.Split(rawMetrics["zk_version"], "-")[0]
 	labels["zk_instance"] = *zkAddress
-	delete(metrics, "zk_version")
+	delete(rawMetrics, "zk_version")
 
-	metrics["zk_server_state"] = getState(metrics["zk_server_state"])
+	metrics["zk_server_state"] = getState(rawMetrics["zk_server_state"])
+	delete(rawMetrics, "zk_server_state")
 
-	
+	for metricName, metric := range rawMetrics {
+		rawValue := metrics[metricName]
+
+		value, err := strconv.ParseFloat(metric, 64)
+		if err == nil {
+			metrics[metricName] = value
+		} else {
+			log.Printf("metric=%+v, value=%+v, error=%+v\n", metricName, rawValue, err)
+		}
+	}
 
 	return metrics, labels
 }
@@ -93,17 +107,13 @@ func scrapMetrics() {
 	for {
 		//log.Print("start scraping")
 
-		metrics, labels := getMetrics()
+		rawMetrics, err := getRawMetrics()
+		errFatal(err)
+		metrics, labels := parseMetrics(rawMetrics)
 
 		for metricName, metric := range promMetrics {
-			rawValue := metrics[metricName]
-
-			value, err := strconv.ParseFloat(rawValue, 64)
-			if err == nil {
-				metric.With(prometheus.Labels(labels)).Set(value)
-			} else {
-				log.Printf("metric=%+v, value=%+v, error=%+v\n", metricName, rawValue, err)
-			}
+			value := metrics[metricName]
+			metric.With(prometheus.Labels(labels)).Set(value)
 		}
 
 		time.Sleep(time.Duration(*scrapeInterval) * time.Second)

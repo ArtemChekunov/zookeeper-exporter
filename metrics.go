@@ -68,4 +68,3 @@ var promMetrics = map[string]prometheus.GaugeVec{
 		Help: "zk_znode_count.",
 	}, []string{"zk_version", "zk_instance"}),
 }
-
